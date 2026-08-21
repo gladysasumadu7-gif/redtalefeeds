@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 
 const chatRoutes = require('./src/routes/chat');
+const modelRoutes = require('./src/routes/models');
 const productRoutes = require('./src/routes/products');
 const paymentRoutes = require('./src/routes/payments');
 
@@ -27,6 +28,7 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/api/v1/chat', chatRoutes);
+app.use('/api/v1', modelRoutes);
 app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 

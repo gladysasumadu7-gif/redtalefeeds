@@ -10,6 +10,13 @@
  *
  * Falls back to a keyword heuristic (no external call) if GEMINI_API_KEY is
  * not set, so the endpoint always works for a demo even with zero keys.
+ *
+ * Model resolution: rather than trusting a hardcoded model name (which can
+ * silently break when Google renames/deprecates models), we check the live
+ * /models list on first use, confirm the configured GEMINI_MODEL is valid,
+ * and fall back to the first model that supports generateContent if not.
+ * This resolution happens once per process (cached in `model`), not per
+ * request.
  */
 
 const { searchOffers } = require('./priceService');
@@ -17,14 +24,54 @@ const { searchOffers } = require('./priceService');
 let genAI = null;
 let model = null;
 
-function getModel() {
+async function fetchAvailableModels() {
+  const key = process.env.GEMINI_API_KEY;
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    headers: { 'X-goog-api-key': key },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Model list request failed: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  return (data.models || []).map((m) => ({
+    name: m.name.replace('models/', ''),
+    supportedGenerationMethods: m.supportedGenerationMethods || [],
+  }));
+}
+
+async function resolveModelName() {
+  const preferred = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+  try {
+    const available = await fetchAvailableModels();
+    const names = available.map((m) => m.name);
+
+    if (names.includes(preferred)) return preferred;
+
+    console.warn(`[geminiService] Configured model "${preferred}" not found. Available: ${names.join(', ')}`);
+    const fallback = available.find((m) => m.supportedGenerationMethods.includes('generateContent'));
+    if (fallback) {
+      console.warn(`[geminiService] Falling back to "${fallback.name}"`);
+      return fallback.name;
+    }
+    return preferred; // nothing usable found; let the real API call surface a clear error
+  } catch (err) {
+    console.warn('[geminiService] Could not verify model availability, using configured value:', err.message);
+    return preferred;
+  }
+}
+
+async function getModel() {
   if (!process.env.GEMINI_API_KEY) return null;
   if (model) return model;
 
   // Lazy-require so the package isn't needed at all if no key is configured
   const { GoogleGenerativeAI } = require('@google/generative-ai');
   genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
+
+  const resolvedModelName = await resolveModelName();
+  console.log(`[geminiService] Using model: ${resolvedModelName}`);
+  model = genAI.getGenerativeModel({ model: resolvedModelName });
   return model;
 }
 
@@ -59,7 +106,7 @@ function heuristicReply(message, offers) {
 // --- Gemini-backed path -------------------------------------------------------
 
 async function decideIntent(message, history) {
-  const m = getModel();
+  const m = await getModel();
   const prompt = `You are the intent-classifier for a shopping assistant. Given the latest user message (and brief chat history for context), decide:
 1. Does the user want to find/buy/compare a product right now?
 2. If yes, what is the concise product search query to use (strip filler words, keep key attributes like size/color/budget)?
@@ -87,7 +134,7 @@ Latest user message: ${message}`;
 }
 
 async function composeReply(message, offers) {
-  const m = getModel();
+  const m = await getModel();
   if (!offers) {
     const prompt = `You are Redtail's friendly AI shopping assistant. Reply conversationally (2-3 sentences max) to the user's message. You cannot place orders yourself — a human agent does that once the user picks an offer.\n\nUser: ${message}`;
     try {
