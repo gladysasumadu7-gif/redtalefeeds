@@ -4,7 +4,7 @@
  * Drives the AI shopping chat. Given the conversation, it:
  *   1. Decides whether the user is asking to find/compare a product, and if
  *      so extracts a clean search query.
- *   2. If yes, calls priceService.searchOffers() to get real/mock offers.
+ *   2. If yes, calls priceService.searchOffers() to get real offers.
  *   3. Asks Gemini to write a short, natural reply presenting those offers
  *      (or just replies conversationally if no product search is needed).
  *
@@ -127,6 +127,152 @@ async function callGemini(modelName, prompt, generationConfig) {
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error('Gemini response had no text content');
   return text.trim();
+}
+// --- Streaming path (used by the SSE/NDJSON /chat route) -------------------
+
+// Streams a single generateContent call via Gemini's SSE endpoint, calling
+// onDelta(text) as each chunk arrives. Resolves with the full concatenated
+// text once the stream ends.
+async function callGeminiStream(modelName, prompt, { signal, onDelta }) {
+  const key = process.env.GEMINI_API_KEY;
+  const response = await fetch(
+    `${GEMINI_API_BASE}/models/${modelName}:streamGenerateContent?alt=sse`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-goog-api-key': key },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      signal,
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Gemini API error: ${response.status} ${text}`);
+  }
+
+  let full = '';
+  let buffer = '';
+  for await (const chunk of response.body) {
+    buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // keep the trailing partial line for next iteration
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const jsonStr = trimmed.slice(5).trim();
+      if (!jsonStr || jsonStr === '[DONE]') continue;
+      try {
+        const parsed = JSON.parse(jsonStr);
+        const delta = parsed.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+        if (delta) {
+          full += delta;
+          onDelta(delta);
+        }
+      } catch {
+        // Partial JSON split across chunk boundaries — safe to skip, the
+        // remainder is already retained in `buffer` for the next iteration.
+      }
+    }
+  }
+
+  if (!full) throw new Error('Gemini stream returned no text content');
+  return full;
+}
+
+// Same model-fallback logic as callGeminiResilient, but for streaming.
+// Only advances to the next candidate if ZERO deltas were emitted for the
+// failed attempt — once we've streamed any real content to the client we
+// can't silently retry from scratch without producing duplicated/garbled
+// text, so a mid-stream failure is thrown as a real error instead.
+async function callGeminiResilientStream(prompt, { signal, onDelta }) {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is not configured');
+  }
+
+  const candidates = await getModelCandidates();
+  let lastErr;
+
+  for (let i = workingModelIndex; i < candidates.length; i += 1) {
+    const modelName = candidates[i];
+    let emitted = 0;
+    try {
+      const full = await callGeminiStream(modelName, prompt, {
+        signal,
+        onDelta: (d) => {
+          emitted += 1;
+          onDelta(d);
+        },
+      });
+      workingModelIndex = i;
+      return full;
+    } catch (err) {
+      lastErr = err;
+      if (emitted > 0) throw err; // already streamed partial content — don't retry silently
+      if (!isModelUnusableError(err)) throw err;
+      console.warn(`[geminiService] Model "${modelName}" unusable (stream): ${err.message.split('\n')[0]}; trying next candidate.`);
+    }
+  }
+
+  throw lastErr || new Error('No Gemini model candidates available');
+}
+
+async function composeReplyStream(message, offers, { signal, onDelta }) {
+  if (!offers) {
+    const prompt = `You are Redtail's friendly AI shopping assistant. Reply conversationally (2-3 sentences max) to the user's message. You cannot place orders yourself — a human agent does that once the user picks an offer.\n\nUser: ${message}`;
+    return callGeminiResilientStream(prompt, { signal, onDelta });
+  }
+
+  if (offers.length === 0) {
+    const text = "I couldn't find any offers for that — try rephrasing what you're looking for.";
+    onDelta(text);
+    return text;
+  }
+
+  const offersSummary = offers
+    .slice(0, 5)
+    .map((o, i) => `${i + 1}. ${o.retailer} — $${o.total.toFixed(2)} total (item $${o.price.toFixed(2)} + shipping $${o.shipping.toFixed(2)}), ETA ${o.etaDays ?? 'unknown'} days`)
+    .join('\n');
+
+  const prompt = `You are Redtail's friendly AI shopping assistant. You just searched for offers for the user's request. Write a short (2-3 sentence) natural reply presenting the results conversationally — mention the best price and retailer, and remind them a human Redtail agent will place the order once they pick one. Do not invent any prices beyond what's given.\n\nUser asked: ${message}\n\nOffers found:\n${offersSummary}`;
+
+  return callGeminiResilientStream(prompt, { signal, onDelta });
+}
+
+/**
+ * Streaming counterpart to handleChatMessage. Calls onOffers(offers) once,
+ * if/when a product search resolves, and onDelta(textChunk) repeatedly as
+ * the reply is generated. Resolves with the final { reply, offers, query }
+ * once the whole turn is done. In demo mode (no key) it still "streams" —
+ * the heuristic reply is delivered as a single onDelta call.
+ */
+async function handleChatMessageStream(message, history = [], { signal, onOffers, onDelta }) {
+  const hasKey = !!process.env.GEMINI_API_KEY;
+
+  const intent = hasKey
+    ? await decideIntent(message, history)
+    : { wantsSearch: heuristicWantsSearch(message), query: heuristicExtractQuery(message) };
+
+  if (!intent.wantsSearch) {
+    if (!hasKey) {
+      const text = heuristicReply(message, null);
+      onDelta(text);
+      return { reply: text, offers: null, query: null };
+    }
+    const reply = await composeReplyStream(message, null, { signal, onDelta });
+    return { reply, offers: null, query: null };
+  }
+
+  const offers = await searchOffers(intent.query);
+  onOffers(offers);
+
+  if (!hasKey) {
+    const text = heuristicReply(message, offers);
+    onDelta(text);
+    return { reply: text, offers, query: intent.query };
+  }
+  const reply = await composeReplyStream(message, offers, { signal, onDelta });
+  return { reply, offers, query: intent.query };
 }
 
 // Runs a prompt against the live model list, starting from the last-known
@@ -289,4 +435,4 @@ async function handleChatMessage(message, history = []) {
   return { reply, offers, query: intent.query };
 }
 
-module.exports = { handleChatMessage };
+module.exports = { handleChatMessage, handleChatMessageStream };
