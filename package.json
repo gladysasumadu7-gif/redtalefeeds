@@ -1,18 +1,25 @@
 {
-  "name": "shopbot-lite",
-  "version": "0.1.0",
-  "description": "Minimal Node.js backend for the Redtail AI shopping app demo. Priority: AI chat endpoint (Gemini) + price comparison endpoint. No auth, no Docker, no DB.",
+  "name": "shopbot-backend",
+  "version": "1.0.0",
+  "description": "Node.js/Express backend for the Redtail AI shopping app. AI chat (Gemini), price comparison, Paystack payments, Google sign-in, and Supabase-backed persistence — all requests except /health and the OAuth/webhook endpoints require a valid session token.",
   "main": "server.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "@supabase/supabase-js": "^2.45.4",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
     "node-fetch": "^2.7.0",
     "uuid": "^9.0.1"
   }

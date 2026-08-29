@@ -1,22 +1,22 @@
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
 const { initializeTransaction, verifyTransaction, verifyWebhookSignature } = require('../services/paymentService');
+const { supabase } = require('../lib/supabase');
+const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// In-memory "orders" so verify has something to attach to — swap for real
-// order creation once you wire a DB back in.
-const paidOrders = new Map(); // reference -> order
-
-// POST /payments/init  { email, amount, offerId?, quantity? }
-router.post('/init', async (req, res) => {
-  const { email, amount, offerId, quantity } = req.body || {};
+// POST /payments/init  { amount, offerId?, quantity? }
+// email comes from the authenticated user, never from the request body —
+// otherwise anyone could initialize a Paystack transaction under someone
+// else's email.
+router.post('/init', requireAuth, async (req, res) => {
+  const { amount, offerId, quantity } = req.body || {};
 
   try {
     const data = await initializeTransaction({
-      email,
+      email: req.user.email,
       amount,
-      metadata: { offerId: offerId || null, quantity: quantity || 1 },
+      metadata: { offerId: offerId || null, quantity: quantity || 1, userId: req.user.id },
     });
     res.json({ authorizationUrl: data.authorization_url, reference: data.reference, accessCode: data.access_code });
   } catch (err) {
@@ -32,7 +32,7 @@ router.post('/init', async (req, res) => {
 // This is the ONLY place an "order" gets marked paid — never trust a client
 // callback alone. Call this after the client's Paystack webview reports
 // success, before you consider the order placed.
-router.post('/verify', async (req, res) => {
+router.post('/verify', requireAuth, async (req, res) => {
   const { reference } = req.body || {};
   if (!reference) return res.status(400).json({ error: 'reference is required' });
 
@@ -43,19 +43,33 @@ router.post('/verify', async (req, res) => {
       return res.status(402).json({ error: 'Payment not successful', status: result.status });
     }
 
-    const order = {
-      id: uuidv4(),
-      reference: result.reference,
-      amount: result.amount,
-      currency: result.currency,
-      customerEmail: result.customerEmail,
-      metadata: result.metadata,
-      paidAt: result.paidAt,
-      status: 'AGENT_REVIEWING', // matches the ShopBot order state machine's entry state
-    };
-    paidOrders.set(reference, order);
+    // Guard against a user verifying a reference that was initialized under
+    // a different account's metadata.
+    if (result.metadata && result.metadata.userId && result.metadata.userId !== req.user.id) {
+      return res.status(403).json({ error: 'This transaction does not belong to your account' });
+    }
 
-    res.json({ order });
+    const { data: order, error } = await supabase
+      .from('orders')
+      .upsert(
+        {
+          user_id: req.user.id,
+          reference: result.reference,
+          amount: result.amount,
+          currency: result.currency,
+          customer_email: result.customerEmail,
+          metadata: result.metadata,
+          paid_at: result.paidAt,
+          status: 'AGENT_REVIEWING', // matches the ShopBot order state machine's entry state
+        },
+        { onConflict: 'reference' }
+      )
+      .select('id, reference, amount, currency, customer_email, metadata, paid_at, status, created_at')
+      .single();
+
+    if (error) throw error;
+
+    res.json({ order: toApiOrder(order) });
   } catch (err) {
     if (err.code === 'PAYSTACK_NOT_CONFIGURED') {
       return res.status(501).json({ error: 'PAYSTACK_SECRET_KEY is not set on the server' });
@@ -66,9 +80,11 @@ router.post('/verify', async (req, res) => {
 });
 
 // POST /payments/webhook — Paystack calls this async, independent of the
-// client. Requires express.raw() body parsing (wired in server.js) so the
-// HMAC check runs against the exact bytes Paystack sent.
-router.post('/webhook', (req, res) => {
+// client and with no user session, so it deliberately has NO requireAuth.
+// Requires express.raw() body parsing, wired in server.js BEFORE the global
+// express.json() for this exact path, so the HMAC check runs against the
+// exact bytes Paystack sent.
+router.post('/webhook', async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
 
   try {
@@ -80,7 +96,29 @@ router.post('/webhook', (req, res) => {
     const event = JSON.parse(rawBody.toString('utf8'));
     console.log('[payments webhook] verified event:', event.event, event.data && event.data.reference);
 
-    // e.g. if (event.event === 'charge.success') { ...update order... }
+    if (event.event === 'charge.success' && event.data && event.data.reference) {
+      // Re-verify directly with Paystack rather than trusting the webhook
+      // payload's amount/status fields, then upsert exactly like /verify does.
+      const result = await verifyTransaction(event.data.reference);
+      if (result.success) {
+        const userId = result.metadata && result.metadata.userId;
+        if (userId) {
+          await supabase.from('orders').upsert(
+            {
+              user_id: userId,
+              reference: result.reference,
+              amount: result.amount,
+              currency: result.currency,
+              customer_email: result.customerEmail,
+              metadata: result.metadata,
+              paid_at: result.paidAt,
+              status: 'AGENT_REVIEWING',
+            },
+            { onConflict: 'reference' }
+          );
+        }
+      }
+    }
 
     res.sendStatus(200);
   } catch (err) {
@@ -89,10 +127,35 @@ router.post('/webhook', (req, res) => {
   }
 });
 
-router.get('/orders/:reference', (req, res) => {
-  const order = paidOrders.get(req.params.reference);
-  if (!order) return res.status(404).json({ error: 'Not found' });
-  res.json({ order });
+router.get('/orders/:reference', requireAuth, async (req, res) => {
+  const { data: order, error } = await supabase
+    .from('orders')
+    .select('id, reference, amount, currency, customer_email, metadata, paid_at, status, created_at, user_id')
+    .eq('reference', req.params.reference)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[payments route] fetch order error:', error);
+    return res.status(500).json({ error: 'Failed to load order' });
+  }
+  if (!order || order.user_id !== req.user.id) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
+  res.json({ order: toApiOrder(order) });
 });
+
+function toApiOrder(row) {
+  return {
+    id: row.id,
+    reference: row.reference,
+    amount: row.amount,
+    currency: row.currency,
+    customerEmail: row.customer_email,
+    metadata: row.metadata,
+    paidAt: row.paid_at,
+    status: row.status,
+  };
+}
 
 module.exports = router;

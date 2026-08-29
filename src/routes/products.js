@@ -12,10 +12,10 @@ router.get('/search', async (req, res) => {
 
   try {
     const offers = await searchOffers(String(query).trim());
-    res.json({ query, offers, provider: process.env.PRICE_PROVIDER || 'mock' });
+    res.json({ query, offers, provider: process.env.PRICE_PROVIDER || 'serpapi' });
   } catch (err) {
     console.error('[products route] error:', err);
-    res.status(500).json({ error: 'Failed to search offers' });
+    res.status(502).json({ error: 'Failed to search offers' });
   }
 });
 

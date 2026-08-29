@@ -1,8 +1,11 @@
-// routes/models.js (or add to your existing chat router)
 const express = require('express');
 const router = express.Router();
 
-router.get('/models', async (req, res) => {
+// Debug/ops endpoint (lists which Gemini models this API key can use) —
+// gated behind auth since it leaks details about the server's AI provider
+// config and has no reason to be publicly reachable.
+// Mounted at /api/v1/models in server.js, so this is the router's root.
+router.get('/', async (req, res) => {
   const key = process.env.GEMINI_API_KEY;
   if (!key) {
     return res.status(500).json({ error: 'GEMINI_API_KEY not configured' });
@@ -17,7 +20,6 @@ router.get('/models', async (req, res) => {
       return res.status(response.status).json({ error: 'Failed to fetch models', details: text });
     }
     const data = await response.json();
-    // Trim to just what's useful: name + which methods each model supports
     const models = (data.models || []).map((m) => ({
       name: m.name,
       displayName: m.displayName,
