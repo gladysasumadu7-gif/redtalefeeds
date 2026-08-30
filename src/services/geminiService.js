@@ -360,8 +360,7 @@ ${recentHistory.map((h) => `${h.role}: ${h.content}`).join('\n')}
 
 Latest user message: ${message}`;
 
-  const baseConfig = { maxOutputTokens: 200 };
-
+const baseConfig = { maxOutputTokens: 500 };
   let raw;
   try {
     raw = await callGeminiResilient(prompt, { ...baseConfig, responseMimeType: 'application/json' });
@@ -413,8 +412,7 @@ User asked: ${message}
 
 Offers found:
 ${offersSummary}`;
-
-  return callGeminiResilient(prompt, { maxOutputTokens: 200 });
+return callGeminiResilient(prompt, { maxOutputTokens: 500 });
 }
 
 /**
