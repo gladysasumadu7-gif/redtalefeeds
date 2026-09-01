@@ -53,6 +53,16 @@
  * from that call, rather than trying to pattern-match Gemini's error text —
  * pattern-matching was silently never triggering and letting the raw 400
  * escape instead of falling back gracefully.
+ *
+ * Model selection from the client + success tracking: callers (see
+ * src/routes/chat.js) may pass a `modelId` through handleChatMessage that
+ * the user picked in the app. When present, it's tried FIRST for that
+ * request — see callGeminiResilient. Every attempt (client-picked or
+ * server-resolved) is recorded in the in-memory `modelStats` map below, and
+ * src/routes/models.js reads that data (via getModelStats) to compute which
+ * model to tag as "recommended" for the picker. This is in-memory only —
+ * it resets on restart/redeploy and isn't shared across instances, which is
+ * fine since it only needs to reflect recent behavior, not be permanent.
  */
 
 const { searchOffers } = require('./priceService');
@@ -61,12 +71,19 @@ const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 // Model names that technically support generateContent but are never right
 // for a text chat/classification use case (text-to-speech, embeddings,
-// etc.) — filtered out so we don't waste an attempt on them.
+// etc.) — filtered out so we don't waste an attempt on them. Exported as
+// isChatCapableModel() so src/routes/models.js can apply the same filter to
+// its own raw /models fetch.
 const NON_CHAT_MODEL_PATTERN = /tts|embedding|aqa|image-generation/i;
+
+function isChatCapableModel(name) {
+  return !NON_CHAT_MODEL_PATTERN.test(name);
+}
 
 // Rough speed ranking for sorting the discovered model list — lower is
 // faster/preferred. Unknown/other names sort ahead of "pro" but behind
-// flash variants.
+// flash variants. Exported so src/routes/models.js can sort its own list
+// the same way.
 function speedRank(modelName) {
   if (/flash-lite/i.test(modelName)) return 0;
   if (/flash/i.test(modelName)) return 1;
@@ -74,8 +91,38 @@ function speedRank(modelName) {
   return 2;
 }
 
+// "gemini-2.0-flash-lite" -> "Gemini 2.0 Flash Lite"
+function formatModelLabel(name) {
+  return name
+    .replace(/^gemini-/, 'Gemini ')
+    .split('-')
+    .map((part) => (/^\d/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(' ');
+}
+
 let modelCandidates = null; // string[] once resolved, either [GEMINI_MODEL] or the discovered list
 let workingModelIndex = 0;
+
+// name -> { attempts, successes }. Populated by every real call through
+// callGeminiResilient, whether the model was client-picked or
+// server-resolved. Read by getModelStats() for the "recommended" tag.
+const modelStats = new Map();
+
+function recordModelResult(modelName, success) {
+  const s = modelStats.get(modelName) || { attempts: 0, successes: 0 };
+  s.attempts += 1;
+  if (success) s.successes += 1;
+  modelStats.set(modelName, s);
+}
+
+function getModelStats() {
+  return Object.fromEntries(modelStats);
+}
+
+// Minimum number of attempts a model needs before its success rate is
+// trusted enough to make it "recommended" — avoids one lucky/unlucky call
+// swinging the tag. Exported for src/routes/models.js to reuse.
+const MIN_SAMPLES_FOR_RECOMMENDATION = 3;
 
 async function fetchAvailableModels() {
   const key = process.env.GEMINI_API_KEY;
@@ -97,7 +144,7 @@ async function discoverModelCandidates() {
   const available = await fetchAvailableModels();
   const discovered = available
     .filter((m) => m.supportedGenerationMethods.includes('generateContent'))
-    .filter((m) => !NON_CHAT_MODEL_PATTERN.test(m.name))
+    .filter((m) => isChatCapableModel(m.name))
     .map((m) => m.name)
     .sort((a, b) => speedRank(a) - speedRank(b));
 
@@ -186,7 +233,7 @@ async function callGemini(modelName, prompt, generationConfig) {
 // tokens before ever producing the visible reply. Not every model supports
 // thinkingConfig, and Gemini's rejection of it usually comes back as a
 // generic 400 with no field name — so we retry once without it on ANY
-// failure from this call, rather than trying to detect the specific cause.
+// failure from that call, rather than trying to detect the specific cause.
 async function callGeminiFast(modelName, prompt, generationConfig = {}) {
   try {
     return await callGemini(modelName, prompt, {
@@ -204,9 +251,30 @@ async function callGeminiFast(modelName, prompt, generationConfig = {}) {
 // on model-unusable errors. If the list was just [GEMINI_MODEL] (pinned)
 // and that single entry fails as unusable, falls through to a one-time
 // live discovery and retries against that list before giving up entirely.
-async function callGeminiResilient(prompt, generationConfig) {
+//
+// modelOverride (optional): a model id the client picked in the UI. If
+// given, it's tried FIRST, ahead of the pinned/discovered candidate list.
+// A transient error (rate limit, network) on the override bubbles up
+// immediately, same as everywhere else in this file. Only an "unusable"
+// error on the override falls through to the normal candidate flow below,
+// so a client picking a since-deprecated model never hard-fails the
+// request — it just silently gets the server's best default instead.
+// Every attempt, override or not, is recorded via recordModelResult.
+async function callGeminiResilient(prompt, generationConfig, modelOverride) {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured');
+  }
+
+  if (modelOverride) {
+    try {
+      const text = await callGeminiFast(modelOverride, prompt, generationConfig);
+      recordModelResult(modelOverride, true);
+      return text;
+    } catch (err) {
+      recordModelResult(modelOverride, false);
+      if (!isModelUnusableError(err)) throw err;
+      console.warn(`[geminiService] Requested model "${modelOverride}" unusable: ${err.message.split('\n')[0]}; falling back to default candidates.`);
+    }
   }
 
   const candidates = await getModelCandidates();
@@ -221,9 +289,11 @@ async function callGeminiResilient(prompt, generationConfig) {
         console.warn(`[geminiService] Switched to model "${modelName}" (previous candidate(s) unusable).`);
       }
       workingModelIndex = i;
+      recordModelResult(modelName, true);
       return text;
     } catch (err) {
       lastErr = err;
+      recordModelResult(modelName, false);
       if (!isModelUnusableError(err)) throw err;
       console.warn(`[geminiService] Model "${modelName}" unusable: ${err.message.split('\n')[0]}; trying next candidate.`);
     }
@@ -233,7 +303,7 @@ async function callGeminiResilient(prompt, generationConfig) {
     console.warn(`[geminiService] Pinned GEMINI_MODEL="${process.env.GEMINI_MODEL}" is unusable — falling back to live /models discovery.`);
     modelCandidates = await discoverModelCandidates();
     workingModelIndex = 0;
-    return callGeminiResilient(prompt, generationConfig); // one retry pass against the discovered list
+    return callGeminiResilient(prompt, generationConfig, modelOverride); // one retry pass against the discovered list
   }
 
   throw lastErr || new Error('No Gemini model candidates available');
@@ -338,8 +408,12 @@ function heuristicPlan(message) {
  *   in the chat history. `query` is null.
  * - "chat": no shopping intent. `reply` is a normal conversational
  *   response. `query` is null.
+ *
+ * @param {string} message
+ * @param {Array<{role: string, content: string}>} history
+ * @param {string|null} modelId - optional client-picked model, see callGeminiResilient
  */
-async function planTurn(message, history) {
+async function planTurn(message, history, modelId) {
   // Enough turns to track preferences gathered across a multi-message
   // discovery conversation (budget mentioned two turns ago, etc.), without
   // sending the whole thread.
@@ -360,15 +434,15 @@ ${recentHistory.map((h) => `${h.role}: ${h.content}`).join('\n')}
 
 Latest user message: ${message}`;
 
-const baseConfig = { maxOutputTokens: 500 };
+  const baseConfig = { maxOutputTokens: 500 };
   let raw;
   try {
-    raw = await callGeminiResilient(prompt, { ...baseConfig, responseMimeType: 'application/json' });
+    raw = await callGeminiResilient(prompt, { ...baseConfig, responseMimeType: 'application/json' }, modelId);
   } catch (err) {
     // Same generic-400 problem as callGeminiFast above — retry
     // unconditionally rather than trying to pattern-match Gemini's error text.
     console.warn(`[geminiService] Call with responseMimeType failed (${err.message.split('\n')[0]}); retrying without it.`);
-    raw = await callGeminiResilient(prompt, baseConfig);
+    raw = await callGeminiResilient(prompt, baseConfig, modelId);
   }
 
   const parsed = extractJson(raw);
@@ -391,7 +465,7 @@ const baseConfig = { maxOutputTokens: 500 };
   };
 }
 
-async function composeReply(message, offers) {
+async function composeReply(message, offers, modelId) {
   const NO_LEAK_INSTRUCTION =
     'Respond with ONLY the final message text — no planning, no drafts, no bullet points, no self-checklist, nothing but the reply itself.';
 
@@ -412,7 +486,7 @@ User asked: ${message}
 
 Offers found:
 ${offersSummary}`;
-return callGeminiResilient(prompt, { maxOutputTokens: 500 });
+  return callGeminiResilient(prompt, { maxOutputTokens: 500 }, modelId);
 }
 
 /**
@@ -436,15 +510,19 @@ return callGeminiResilient(prompt, { maxOutputTokens: 500 });
  * like a successful reply with wrong data.
  *
  * Demo behavior (no GEMINI_API_KEY): always succeeds via the heuristic.
+ * modelId is ignored in this mode since no Gemini call is made.
  *
  * @param {string} message - latest user message
  * @param {Array<{role: 'user'|'assistant', content: string}>} history
+ * @param {string|null} modelId - optional model the client picked in the UI.
+ *   Tried first; falls back to the server's normal pinned/discovered
+ *   candidates if it turns out to be unusable. See callGeminiResilient.
  * @returns {{reply: string, offers: Array|null, query: string|null}}
  */
-async function handleChatMessage(message, history = []) {
+async function handleChatMessage(message, history = [], modelId = null) {
   const hasKey = !!process.env.GEMINI_API_KEY;
 
-  const plan = hasKey ? await planTurn(message, history) : heuristicPlan(message);
+  const plan = hasKey ? await planTurn(message, history, modelId) : heuristicPlan(message);
 
   if (plan.action !== 'search') {
     // "clarify" and "chat" both just surface plan.reply as-is — the only
@@ -453,8 +531,15 @@ async function handleChatMessage(message, history = []) {
   }
 
   const offers = await searchOffers(plan.query);
-  const reply = hasKey ? await composeReply(message, offers) : heuristicReply(message, offers);
+  const reply = hasKey ? await composeReply(message, offers, modelId) : heuristicReply(message, offers);
   return { reply, offers, query: plan.query };
 }
 
-module.exports = { handleChatMessage };
+module.exports = {
+  handleChatMessage,
+  isChatCapableModel,
+  speedRank,
+  formatModelLabel,
+  getModelStats,
+  MIN_SAMPLES_FOR_RECOMMENDATION,
+};

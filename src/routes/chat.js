@@ -78,12 +78,15 @@ router.get('/threads/:id/messages', async (req, res) => {
   }
 });
 
-// POST /chat/threads/:id/messages  { message: string }
+// POST /chat/threads/:id/messages  { message: string, modelId?: string }
 router.post('/threads/:id/messages', async (req, res) => {
-  const { message } = req.body || {};
+  const { message, modelId } = req.body || {};
 
   if (!message || typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: 'message (non-empty string) is required' });
+  }
+  if (modelId !== undefined && (typeof modelId !== 'string' || !modelId.trim())) {
+    return res.status(400).json({ error: 'modelId must be a non-empty string if provided' });
   }
 
   try {
@@ -94,7 +97,6 @@ router.post('/threads/:id/messages', async (req, res) => {
       .insert({ thread_id: thread.id, role: 'user', content: message.trim() });
     if (insertUserErr) throw insertUserErr;
 
-    // Only the last few turns are needed for intent classification context.
     const { data: recentMessages, error: historyErr } = await supabase
       .from('chat_messages')
       .select('role, content')
@@ -105,10 +107,10 @@ router.post('/threads/:id/messages', async (req, res) => {
 
     const history = recentMessages
       .reverse()
-      .slice(0, -1) // drop the user message we just inserted, handleChatMessage takes it separately
+      .slice(0, -1)
       .map((m) => ({ role: m.role, content: m.content }));
 
-    const { reply, offers, query } = await handleChatMessage(message.trim(), history);
+    const { reply, offers, query } = await handleChatMessage(message.trim(), history, modelId || null);
 
     const { data: assistantRow, error: insertAssistantErr } = await supabase
       .from('chat_messages')
@@ -147,5 +149,4 @@ router.post('/threads/:id/messages', async (req, res) => {
     res.status(502).json({ error: 'Failed to process chat message' });
   }
 });
-
 module.exports = router;
