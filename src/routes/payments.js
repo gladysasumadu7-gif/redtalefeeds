@@ -49,6 +49,8 @@ router.post('/verify', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'This transaction does not belong to your account' });
     }
 
+    const isNewOrder = await isNewReference(result.reference);
+
     const { data: order, error } = await supabase
       .from('orders')
       .upsert(
@@ -61,6 +63,10 @@ router.post('/verify', requireAuth, async (req, res) => {
           metadata: result.metadata,
           paid_at: result.paidAt,
           status: 'AGENT_REVIEWING', // matches the ShopBot order state machine's entry state
+          // No item breakdown exists yet at checkout time (see order_items,
+          // populated later by an agent), so subtotal starts equal to the
+          // full amount until fees are itemized on the dashboard.
+          subtotal: result.amount,
         },
         { onConflict: 'reference' }
       )
@@ -68,6 +74,16 @@ router.post('/verify', requireAuth, async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    // Seed the customer-visible timeline exactly once, the first time this
+    // reference is ever paid — the agent dashboard appends to it from here.
+    if (isNewOrder) {
+      await supabase.from('order_timeline_events').insert({
+        order_id: order.id,
+        status: 'AGENT_REVIEWING',
+        label: 'Payment confirmed',
+      });
+    }
 
     res.json({ order: toApiOrder(order) });
   } catch (err) {
@@ -103,19 +119,32 @@ router.post('/webhook', async (req, res) => {
       if (result.success) {
         const userId = result.metadata && result.metadata.userId;
         if (userId) {
-          await supabase.from('orders').upsert(
-            {
-              user_id: userId,
-              reference: result.reference,
-              amount: result.amount,
-              currency: result.currency,
-              customer_email: result.customerEmail,
-              metadata: result.metadata,
-              paid_at: result.paidAt,
+          const isNewOrder = await isNewReference(result.reference);
+          const { data: order } = await supabase
+            .from('orders')
+            .upsert(
+              {
+                user_id: userId,
+                reference: result.reference,
+                amount: result.amount,
+                currency: result.currency,
+                customer_email: result.customerEmail,
+                metadata: result.metadata,
+                paid_at: result.paidAt,
+                status: 'AGENT_REVIEWING',
+                subtotal: result.amount,
+              },
+              { onConflict: 'reference' }
+            )
+            .select('id')
+            .single();
+          if (isNewOrder && order) {
+            await supabase.from('order_timeline_events').insert({
+              order_id: order.id,
               status: 'AGENT_REVIEWING',
-            },
-            { onConflict: 'reference' }
-          );
+              label: 'Payment confirmed',
+            });
+          }
         }
       }
     }
@@ -144,6 +173,11 @@ router.get('/orders/:reference', requireAuth, async (req, res) => {
 
   res.json({ order: toApiOrder(order) });
 });
+
+async function isNewReference(reference) {
+  const { data } = await supabase.from('orders').select('id').eq('reference', reference).maybeSingle();
+  return !data;
+}
 
 function toApiOrder(row) {
   return {

@@ -16,6 +16,8 @@ services:
         sync: false
       - key: APP_JWT_SECRET
         sync: false
+      - key: AGENT_JWT_SECRET
+        sync: false
       - key: GOOGLE_CLIENT_ID
         sync: false
       - key: GOOGLE_CLIENT_SECRET

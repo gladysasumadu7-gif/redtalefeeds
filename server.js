@@ -10,7 +10,11 @@ const chatRoutes = require('./src/routes/chat');
 const modelRoutes = require('./src/routes/models');
 const productRoutes = require('./src/routes/products');
 const paymentRoutes = require('./src/routes/payments');
+const agentAuthRoutes = require('./src/routes/agentAuth');
+const agentOrderRoutes = require('./src/routes/agentOrders');
+const agentCustomerRoutes = require('./src/routes/agentCustomers');
 const { requireAuth } = require('./src/middleware/auth');
+const { requireAgent } = require('./src/middleware/agentAuth');
 
 // Fail fast on missing required config rather than booting into a broken
 // state. lib/supabase.js and lib/jwt.js already throw on require() if their
@@ -25,6 +29,13 @@ if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET || !proce
   console.warn(
     '[startup] GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI are not fully set — ' +
     'Google sign-in will return 501 until these are configured.'
+  );
+}
+if (!process.env.AGENT_JWT_SECRET) {
+  console.warn(
+    '[startup] AGENT_JWT_SECRET is not set — the agent dashboard API will return 501 until this ' +
+    'is configured. Generate one with `openssl rand -hex 32` and provision an agent with ' +
+    '`node scripts/create-agent.js`.'
   );
 }
 
@@ -94,6 +105,14 @@ app.use('/api/v1/products', requireAuth, productRoutes);
 // payments.js applies requireAuth per-route itself, since /webhook must
 // stay public for Paystack to call it.
 app.use('/api/v1/payments', paymentRoutes);
+
+// Agent dashboard — a completely separate identity/auth track from the
+// customer app above (see src/lib/agentJwt.js and src/middleware/agentAuth.js).
+// /agent/auth/login is public (it IS the login flow); everything else under
+// /agent requires a valid agent token, never a customer one.
+app.use('/api/v1/agent/auth', authLimiter, agentAuthRoutes);
+app.use('/api/v1/agent/orders', requireAgent, agentOrderRoutes);
+app.use('/api/v1/agent/customers', requireAgent, agentCustomerRoutes);
 
 // Fallback 404
 app.use((req, res) => {
