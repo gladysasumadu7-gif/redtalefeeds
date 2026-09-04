@@ -156,6 +156,66 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
+// GET /payments/orders — list the authenticated user's own orders
+router.get('/orders', requireAuth, async (req, res) => {
+  const { data: orders, error } = await supabase
+    .from('orders')
+    .select('id, reference, amount, currency, customer_email, metadata, paid_at, status, created_at, user_id')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('[payments route] list orders error:', error);
+    return res.status(500).json({ error: 'Failed to load orders' });
+  }
+  res.json({ orders: orders.map(toApiOrder) });
+});
+
+// GET /payments/orders/id/:id — full detail incl. items + timeline, scoped
+// to the owning user. (The existing /orders/:reference route below is keyed
+// by Paystack reference, not order id — this one is keyed by order id, for
+// the order-detail/tracking screen.)
+router.get('/orders/id/:id', requireAuth, async (req, res) => {
+  const { data: order, error } = await supabase
+    .from('orders')
+    .select(
+      `id, reference, amount, currency, customer_email, metadata, paid_at, status, created_at,
+       subtotal, shipping_fee, service_fee, shipping_address, carrier, tracking_number,
+       estimated_delivery, window_closes_at, agent_note, user_id`
+    )
+    .eq('id', req.params.id)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[payments route] fetch order by id error:', error);
+    return res.status(500).json({ error: 'Failed to load order' });
+  }
+  if (!order || order.user_id !== req.user.id) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
+  const { data: timeline, error: tErr } = await supabase
+    .from('order_timeline_events')
+    .select('id, status, label, note, occurred_at')
+    .eq('order_id', req.params.id)
+    .order('occurred_at', { ascending: true });
+  if (tErr) {
+    console.error('[payments route] fetch order timeline error:', tErr);
+    return res.status(500).json({ error: 'Failed to load order timeline' });
+  }
+
+  const { data: items, error: itemsErr } = await supabase
+    .from('order_items')
+    .select('id, title, retailer, price, quantity, image_url, offer_url')
+    .eq('order_id', req.params.id);
+  if (itemsErr) {
+    console.error('[payments route] fetch order items error:', itemsErr);
+    return res.status(500).json({ error: 'Failed to load order items' });
+  }
+
+  res.json({ order: toApiOrderWithDetail(order, items || [], timeline || []) });
+});
+
 router.get('/orders/:reference', requireAuth, async (req, res) => {
   const { data: order, error } = await supabase
     .from('orders')
@@ -189,6 +249,38 @@ function toApiOrder(row) {
     metadata: row.metadata,
     paidAt: row.paid_at,
     status: row.status,
+  };
+}
+
+function toApiOrderWithDetail(row, items, timeline) {
+  return {
+    ...toApiOrder(row),
+    subtotal: row.subtotal,
+    shippingFee: row.shipping_fee,
+    serviceFee: row.service_fee,
+    total: row.amount,
+    shippingAddress: row.shipping_address,
+    carrier: row.carrier,
+    trackingNumber: row.tracking_number,
+    estimatedDelivery: row.estimated_delivery,
+    windowClosesAt: row.window_closes_at,
+    agentNote: row.agent_note,
+    items: items.map((it) => ({
+      id: it.id,
+      title: it.title,
+      retailer: it.retailer,
+      price: it.price,
+      quantity: it.quantity,
+      imageUrl: it.image_url,
+      offerUrl: it.offer_url,
+    })),
+    timeline: timeline.map((ev) => ({
+      id: ev.id,
+      status: ev.status,
+      label: ev.label,
+      note: ev.note,
+      occurredAt: ev.occurred_at,
+    })),
   };
 }
 

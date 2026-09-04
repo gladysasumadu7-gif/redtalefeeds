@@ -6,6 +6,7 @@ web-build/
 .env.example
 *.log
 .DS_Store
+release.zip
 ios/
 android/
 backend/
