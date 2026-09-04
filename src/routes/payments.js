@@ -1,27 +1,47 @@
 const express = require('express');
 const { initializeTransaction, verifyTransaction, verifyWebhookSignature } = require('../services/paymentService');
+const { convertUsdToGhs } = require('../services/fxService');
 const { supabase } = require('../lib/supabase');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
 // POST /payments/init  { amount, offerId?, quantity? }
+// `amount` arrives in USD (see priceService.js — product offers are priced
+// in USD), but this Paystack merchant account only supports GHS, so it's
+// converted here, server-side, before ever reaching Paystack. Never trust
+// a client-supplied amount OR let the client do the conversion itself.
 // email comes from the authenticated user, never from the request body —
 // otherwise anyone could initialize a Paystack transaction under someone
 // else's email.
 router.post('/init', requireAuth, async (req, res) => {
   const { amount, offerId, quantity } = req.body || {};
 
+  if (!amount || typeof amount !== 'number' || amount <= 0) {
+    return res.status(400).json({ error: 'amount must be a positive number' });
+  }
+
   try {
+    const amountGhs = await convertUsdToGhs(amount);
+
     const data = await initializeTransaction({
       email: req.user.email,
-      amount,
-      metadata: { offerId: offerId || null, quantity: quantity || 1, userId: req.user.id },
+      amount: amountGhs,
+      currency: 'GHS',
+      metadata: {
+        offerId: offerId || null,
+        quantity: quantity || 1,
+        userId: req.user.id,
+        amountUsd: amount, // kept for reconciliation/support — the rate can drift day to day
+      },
     });
     res.json({ authorizationUrl: data.authorization_url, reference: data.reference, accessCode: data.access_code });
   } catch (err) {
     if (err.code === 'PAYSTACK_NOT_CONFIGURED') {
       return res.status(501).json({ error: 'PAYSTACK_SECRET_KEY is not set on the server' });
+    }
+    if (err.code === 'FX_NOT_CONFIGURED') {
+      return res.status(503).json({ error: err.message });
     }
     console.error('[payments route] init error:', err.message);
     res.status(400).json({ error: err.message });
